@@ -19,7 +19,7 @@ import torch
 import torch.optim as optim
 
 from torch_geometric.datasets import TUDataset
-from torch_geometric.datasets import Planetoid
+from torch_geometric.datasets import Planetoid, ZINC, PPI
 from torch_geometric.data import DataLoader
 
 import torch_geometric.transforms as T
@@ -29,48 +29,70 @@ from torch.utils.tensorboard import SummaryWriter
 from sklearn.manifold import TSNE
 import matplotlib.pyplot as plt
 
+class PrintLayer(nn.Module):
+    def __init__(self):
+        super(PrintLayer, self).__init__()
+    
+    def forward(self, x):
+        print(x.dtype, "#"*10)
+        return x
+
 
 class TestGNN(nn.Module):
-    def __init__(self, input_dim, output_dim):
+    def __init__(self, input_dim, output_dim, edge_dim):
         super(TestGNN, self).__init__()
 
         self.dropout = 0.25
         self.num_convs = 3
+        self.edge_dim = edge_dim
 
-        self.convs = nn.ModuleList([
-          torchgeo_nn.GCNConv(input_dim, 32),
-          torchgeo_nn.GCNConv(32, 64),
-          torchgeo_nn.GCNConv(64, 128),
-        ])
-
-        self.norms = nn.ModuleList([
+        self.model = torchgeo_nn.Sequential('x, edge_index, edge_attr', [
+            (PrintLayer(), "x -> x"),
+            (torchgeo_nn.NNConv(input_dim, 32, self.edge_feat_net(input_dim, 32)), 'x, edge_index, edge_attr -> x'),
+            PrintLayer(),
+            nn.ReLU(),
+            nn.Dropout(p=self.dropout),
             nn.LayerNorm(32),
+            (torchgeo_nn.NNConv(32, 64, self.edge_feat_net(32, 64)), 'x, edge_index, edge_attr -> x'),
+            PrintLayer(),
+            nn.ReLU(),
+            nn.Dropout(p=self.dropout),
             nn.LayerNorm(64),
+            (torchgeo_nn.NNConv(64, 128, self.edge_feat_net(64, 128)), 'x, edge_index, edge_attr -> x'),
+            PrintLayer(),
+            
         ])
 
         # post-message-passing
         self.post_mp = nn.Sequential(
+            nn.ReLU(),
+            nn.Dropout(p=self.dropout),
             nn.Linear(128, 64), 
+            nn.Dropout(self.dropout),
             nn.Linear(64, output_dim),
-            nn.Dropout(self.dropout)
         )
 
         
+    def edge_feat_net(self, input_dims, output_dims):
+        return nn.Sequential(
+            nn.Linear(self.edge_dim, self.edge_dim, dtype=torch.float32), 
+            nn.ReLU(), 
+            nn.Linear(self.edge_dim, input_dims * output_dims, dtype=torch.float32)
+        )
+        
         
     def forward(self, data):
-        x, edge_index, batch = data.x, data.edge_index, data.batch
+        x, edge_index, edge_attr, batch = data.x, data.edge_index, data.edge_attr, data.batch
         if data.num_node_features == 0:
           x = torch.ones(data.num_nodes, 1)
-
-        for i in range(self.num_convs):
-            x = self.convs[i](x, edge_index)
-            emb = x
-            x = F.relu(x)
-            x = F.dropout(x, p=self.dropout, training=self.training)
-            if i != self.num_convs - 1:
-                x = self.norms[i](x)
-
-        x = self.post_mp(x)
+        x = x.type(torch.FloatTensor)
+        # edge_index = edge_index.to(torch.float32)
+        edge_attr = edge_attr.to(torch.float32)
+        # print(x, edge_attr)
+        # print(type(x), type(edge_attr))
+        # split network in two, so we can get node embbedings for visualization
+        emb = self.model(x, edge_index, edge_attr)
+        x = self.post_mp(emb)
 
         return emb, F.log_softmax(x, dim=1)
 
@@ -79,9 +101,10 @@ class TestGNN(nn.Module):
     
 def train(dataset, writer):
     test_loader = loader = DataLoader(dataset, batch_size=64, shuffle=True)
+    print(dataset.num_edge_features, dataset.num_node_features)
 
     # build model
-    learner = TestGNN(max(dataset.num_node_features, 1), dataset.num_classes)
+    learner = TestGNN(max(dataset.num_node_features, 1), dataset.num_classes, max(dataset.num_edge_features, 1))
     opt = optim.Adam(learner.parameters(), lr=0.01)
     
     # train
@@ -90,7 +113,7 @@ def train(dataset, writer):
         learner.train()
         for batch in loader:
             #print(batch.train_mask, '----')
-            print(batch)
+            # print(batch)
             opt.zero_grad()
             embedding, pred = learner(batch)
             label = batch.y
@@ -140,7 +163,7 @@ EPOCHS = 200
 
 writer = SummaryWriter("./runs/" + datetime.now().strftime("%Y%m%d-%H%M%S"))
 
-dataset = Planetoid(root='/tmp/cora', name='cora')
+dataset = ZINC(root='/tmp/zinc', subset=True)
 
 model = train(dataset, writer)
 
@@ -153,6 +176,7 @@ embs = []
 colors = []
 model.eval()
 for batch in loader:
+    # print(batch.edge_index.size())
     emb, pred = model(batch)
     embs.append(emb)
     colors += [color_list[y] for y in batch.y]
